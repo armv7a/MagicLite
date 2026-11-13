@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate tag
+        shell: bash
+        run: |
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          python3 scripts/release_metadata.py --tag "$RELEASE_TAG" --commit "$(git rev-parse HEAD)" --output-dir "$RUNNER_TEMP/version"
+
+      - name: Restore signing key
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.MAGICLITE_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.MAGICLITE_KEYPASS }}
+        run: |
+          set -euo pipefail
+          : "${KEYSTORE_BASE64:?Set the MAGICLITE_KEYSTORE_BASE64 repository secret}"
+          : "${KEYSTORE_PASSWORD:?Set the MAGICLITE_KEYPASS repository secret}"
+          umask 077
+          printf "%s" "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/magiclite-release.jks"
+          echo "MAGICLITE_KEYSTORE=$RUNNER_TEMP/magiclite-release.jks" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android build tools and pinned Java dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${ANDROID_HOME:?GitHub runner Android SDK is missing}"
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -n 1)
+          test -n "$SDKMANAGER"
+          # yes(1) can die on SIGPIPE under pipefail, so feed licenses from a file.
+          printf 'y\n%.0s' {1..50} > "$RUNNER_TEMP/sdk-licenses.txt"
+          "$SDKMANAGER" --licenses < "$RUNNER_TEMP/sdk-licenses.txt" > /dev/null
+          "$SDKMANAGER" "platforms;android-34" "build-tools;34.0.0"
+          echo "$ANDROID_HOME/build-tools/34.0.0" >> "$GITHUB_PATH"
+          echo "ANDROID_JAR=$ANDROID_HOME/platforms/android-34/android.jar" >> "$GITHUB_ENV"
+          mkdir -p .deps
+          curl --fail --location --retry 3 --max-time 120 https://repo.maven.apache.org/maven2/io/github/libxposed/api/101.0.1/api-101.0.1.aar -o .deps/api.aar
+          echo "31ef4bd9d8e783354c0706ec29e5bd421011e73d20dbb01e08e9cf2658ba6047  .deps/api.aar" | sha256sum -c -
+          unzip -p .deps/api.aar classes.jar > .deps/libxposed-api-101.0.1.jar
+          curl --fail --location --retry 3 --max-time 180 https://dl.google.com/dl/android/maven2/com/android/tools/r8/9.5.29/r8-9.5.29.jar -o .deps/r8.jar
+          echo "f8c762ff84640b10083b934a47278758a7665977e618fab0c927fff00521dea3  .deps/r8.jar" | sha256sum -c -
+          echo "R8_JAR=$GITHUB_WORKSPACE/.deps/r8.jar" >> "$GITHUB_ENV"
+
+      - name: Build signed APK and module
+        env:
+          MAGICLITE_KEYPASS: ${{ secrets.MAGICLITE_KEYPASS }}
+          MAGICLITE_KEY_ALIAS: ${{ secrets.MAGICLITE_KEY_ALIAS || 'litefix' }}
+        run: bash scripts/build.sh
+
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          COMMIT=$(git rev-parse HEAD)
+          STEM="MagicLite-$RELEASE_TAG(${COMMIT:0:7})"
+          APK="dist/$STEM.apk"
+          MODULE="dist/$STEM.zip"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$APK" "$MODULE" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$APK" "$MODULE" --verify-tag --generate-notes --title "$RELEASE_TAG"
+          fi
+
+      - name: Remove temporary signing key
+        if: always()
+        shell: bash
+        run: rm -f -- "${RUNNER_TEMP:?}/magiclite-release.jks"
